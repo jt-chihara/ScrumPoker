@@ -1,7 +1,7 @@
 //! Durable Object implementation responsible for managing room state.
 
 use serde::Deserialize;
-use worker::{durable_object, DurableObject, Env, Method, Request, Response, Result, State};
+use worker::{console_log, durable_object, DurableObject, Env, Method, Request, Response, Result, State, WebSocket, WebSocketPair};
 
 use crate::{
     messages::ServerMessage,
@@ -32,18 +32,28 @@ pub struct RoomDurableObject {
     state: State,
     #[allow(dead_code)]
     env: Env,
+    #[allow(clippy::vec_box)]
+    connections: Vec<WebSocket>,
 }
 
 #[durable_object]
 impl DurableObject for RoomDurableObject {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env }
+        Self { state, env, connections: Vec::new() }
     }
 
     async fn fetch(&mut self, req: Request) -> Result<Response> {
         let mut req = req;
+        // WebSocket upgrade path: if Upgrade header is present, accept and attach to room
+        if let Some(upgrade) = req.headers().get("Upgrade")? {
+            if upgrade.eq_ignore_ascii_case("websocket") {
+                console_log!("[DO:{}] WebSocket upgrade accepted", self.room_id());
+                return self.handle_ws_upgrade();
+            }
+        }
+
         let method = req.method();
-        let path = req.path()?;
+        let path = req.path();
 
         match path.as_str() {
             "/state" if method == Method::Get => self.handle_state().await,
@@ -67,25 +77,31 @@ impl DurableObject for RoomDurableObject {
 }
 
 impl RoomDurableObject {
+    fn handle_ws_upgrade(&mut self) -> Result<Response> {
+        let pair = WebSocketPair::new()?;
+        let server = pair.server;
+        let client = pair.client;
+        server.accept()?;
+
+        // Keep track of live connections in memory
+        self.connections.push(server);
+
+        // Send current room state to the newly connected client via HTTP upgrade response
+        Response::from_websocket(client)
+    }
+
     fn room_id(&self) -> String {
         self.state.id().to_string()
     }
 
     async fn load_room(&mut self) -> Result<Room> {
-        if let Some(room) = self
-            .state
-            .storage()
-            .get::<Room>(ROOM_STORAGE_KEY)
-            .await? 
-        {
-            Ok(room)
-        } else {
-            let room = Room::new(self.room_id());
-            self.state
-                .storage()
-                .put(ROOM_STORAGE_KEY, &room)
-                .await?;
-            Ok(room)
+        match self.state.storage().get::<Room>(ROOM_STORAGE_KEY).await {
+            Ok(room) => Ok(room),
+            Err(_) => {
+                let room = Room::new(self.room_id());
+                self.state.storage().put(ROOM_STORAGE_KEY, &room).await?;
+                Ok(room)
+            }
         }
     }
 
@@ -97,11 +113,14 @@ impl RoomDurableObject {
     }
 
     async fn delete_room(&mut self) -> Result<()> {
-        self.state.storage().delete(ROOM_STORAGE_KEY).await
+        self.state.storage().delete(ROOM_STORAGE_KEY).await?;
+        Ok(())
     }
 
     async fn handle_state(&mut self) -> Result<Response> {
         let room = self.load_room().await?;
+        // Also try to push current state to all connections
+        let _ = self.broadcast(ServerMessage::RoomState { room: room.clone() });
         Self::json(ServerMessage::RoomState { room })
     }
 
@@ -113,6 +132,10 @@ impl RoomDurableObject {
                 room.is_voting = true;
                 room.show_results = false;
                 self.save_room(&room).await?;
+                console_log!("[DO:{}] user joined: {}", self.room_id(), payload.user_id);
+                let _ = self.broadcast(ServerMessage::UsersUpdate {
+                    users: room.users.clone(),
+                });
                 Self::json(ServerMessage::RoomState { room })
             }
             Err(RoomError::UserAlreadyExists) => {
@@ -133,7 +156,9 @@ impl RoomDurableObject {
                 }
                 self.save_room(&room).await?;
             }
-            Self::json(ServerMessage::UserLeft { user })
+            console_log!("[DO:{}] user left: {}", self.room_id(), payload.user_id);
+            let _ = self.broadcast(ServerMessage::UserLeft { user: user.clone() });
+            Self::json(ServerMessage::UsersUpdate { users: room.users.clone() })
         } else {
             Self::json(ServerMessage::error("user not found"))
         }
@@ -147,13 +172,13 @@ impl RoomDurableObject {
                 room.is_voting = true;
                 self.save_room(&room).await?;
                 if room.all_voted() {
-                    Self::json(ServerMessage::UsersUpdate {
-                        users: room.users.clone(),
-                    })
+                    console_log!("[DO:{}] all voted", self.room_id());
+                    let _ = self.broadcast(ServerMessage::UsersUpdate { users: room.users.clone() });
+                    Self::json(ServerMessage::UsersUpdate { users: room.users.clone() })
                 } else {
-                    Self::json(ServerMessage::UserVoted {
-                        user_id: payload.user_id,
-                    })
+                    console_log!("[DO:{}] user voted: {}", self.room_id(), payload.user_id);
+                    let _ = self.broadcast(ServerMessage::UserVoted { user_id: payload.user_id.clone() });
+                    Self::json(ServerMessage::UserVoted { user_id: payload.user_id })
                 }
             }
             Err(err) => Self::json(ServerMessage::error(err.to_string())),
@@ -168,19 +193,29 @@ impl RoomDurableObject {
         room.show_results = true;
         room.is_voting = false;
         self.save_room(&room).await?;
-        Self::json(ServerMessage::ResultsShown {
-            users: room.users.clone(),
-        })
+        console_log!("[DO:{}] results shown", self.room_id());
+        let msg = ServerMessage::ResultsShown { users: room.users.clone() };
+        let _ = self.broadcast(msg.clone());
+        Self::json(msg)
     }
 
     async fn handle_reset_votes(&mut self) -> Result<Response> {
         let mut room = self.load_room().await?;
         room.reset_votes();
         self.save_room(&room).await?;
-        Self::json(ServerMessage::VotesReset)
+        console_log!("[DO:{}] votes reset", self.room_id());
+        let msg = ServerMessage::VotesReset;
+        let _ = self.broadcast(msg.clone());
+        Self::json(msg)
     }
 
     fn json(message: ServerMessage) -> Result<Response> {
         Response::from_json(&message)
+    }
+
+    fn broadcast(&mut self, message: ServerMessage) -> Result<()> {
+        let payload = serde_json::to_string(&message).unwrap_or_else(|_| "{}".into());
+        self.connections.retain(|ws| ws.send_with_str(&payload).is_ok());
+        Ok(())
     }
 }
