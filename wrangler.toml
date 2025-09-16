@@ -1,0 +1,15 @@
+name = "scrum-poker-app"
+main = "worker/build/worker/shim.mjs"
+compatibility_date = "2024-09-23"
+
+[build]
+command = "sh ./scripts/build-worker.sh"
+
+[durable_objects]
+bindings = [
+  { name = "ROOM_DURABLE_OBJECT", class_name = "RoomDurableObject" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RoomDurableObject"]
