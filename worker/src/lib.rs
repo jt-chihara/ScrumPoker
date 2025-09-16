@@ -2,6 +2,7 @@ mod durable;
 mod messages;
 mod models;
 mod router;
+mod websocket;
 mod utils;
 
 #[cfg(feature = "wee_alloc")]
