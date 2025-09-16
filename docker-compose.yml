@@ -1,0 +1,38 @@
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    working_dir: /workspace
+    command: wrangler dev --local --persist-to=/workspace/.wrangler/state --port=8787 --ip=0.0.0.0
+    ports:
+      - "8787:8787"
+    environment:
+      - WRANGLER_LOG=debug
+    volumes:
+      - ./:/workspace
+      - worker_cargo_registry:/usr/local/cargo/registry
+      - worker_cargo_git:/usr/local/cargo/git
+      - worker_target:/workspace/worker/target
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    working_dir: /workspace/web
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE=ws://worker:8787
+    volumes:
+      - ./web:/workspace/web
+      - frontend_node_modules:/workspace/web/node_modules
+    depends_on:
+      - worker
+
+volumes:
+  frontend_node_modules:
+  worker_cargo_registry:
+  worker_cargo_git:
+  worker_target:
